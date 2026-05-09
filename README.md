@@ -36,14 +36,60 @@ The build creates `dist/index.js`. OpenCode imports that built file directly.
 
 ## Get A Zed LLM Token
 
-Set your token in the shell that launches OpenCode:
+This provider needs a short-lived Zed Cloud LLM token. The LLM token is minted
+from your normal signed-in Zed account credentials.
+
+### 1. Find Your Zed Account Credentials
+
+You need two values:
+
+- `ZED_USER_ID`: your legacy numeric Zed user id.
+- `ZED_ACCESS_TOKEN`: your Zed account access token.
+
+On macOS, Zed stores these in Keychain. Open **Keychain Access**, search for
+`zed.dev`, and inspect the Internet password entry:
+
+- The **Account** field is the numeric user id.
+- The password value is the account access token.
+
+Treat the access token like a password. Do not commit it, paste it into logs, or
+share it.
+
+### 2. Mint The LLM Token
+
+Use the account credentials to call Zed Cloud's LLM-token endpoint:
+
+```sh
+export ZED_USER_ID="your-numeric-user-id"
+export ZED_ACCESS_TOKEN="your-zed-account-access-token"
+
+curl https://cloud.zed.dev/client/llm_tokens \
+  -X POST \
+  -H "Authorization: ${ZED_USER_ID} ${ZED_ACCESS_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data '{"organization_id":null}'
+```
+
+The response includes a `token` field:
+
+```json
+{
+  "version": 2,
+  "id": "client_token_...",
+  "token": "..."
+}
+```
+
+### 3. Export The LLM Token
+
+Set the returned `token` value in the shell that launches OpenCode:
 
 ```sh
 export ZED_LLM_TOKEN="your-zed-llm-token"
 ```
 
-The token is short-lived. If requests start returning `401 Unauthorized`, mint
-a new token and update `ZED_LLM_TOKEN`.
+The LLM token is short-lived. If requests start returning `401 Unauthorized`,
+repeat the minting step and update `ZED_LLM_TOKEN`.
 
 ## Configure OpenCode
 
