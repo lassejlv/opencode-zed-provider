@@ -19,7 +19,9 @@ Cloud's wrapped `provider_request` format.
 - Node.js 20 or newer.
 - npm.
 - OpenCode.
-- A valid Zed Cloud LLM token in `ZED_LLM_TOKEN`.
+- A valid Zed Cloud LLM token in `ZED_LLM_TOKEN`, refresh credentials in
+  `ZED_USER_ID` and `ZED_ACCESS_TOKEN`, or signed-in Zed credentials in macOS
+  Keychain.
 
 ## Install
 
@@ -88,8 +90,21 @@ Set the returned `token` value in the shell that launches OpenCode:
 export ZED_LLM_TOKEN="your-zed-llm-token"
 ```
 
-The LLM token is short-lived. If requests start returning `401 Unauthorized`,
-repeat the minting step and update `ZED_LLM_TOKEN`.
+The LLM token is short-lived. If requests return `401 Unauthorized`, the
+provider can refresh it automatically from macOS Keychain when you are signed
+in to Zed.
+
+You can also provide refresh credentials explicitly:
+
+```sh
+export ZED_USER_ID="your-numeric-user-id"
+export ZED_ACCESS_TOKEN="your-zed-account-access-token"
+export ZED_LLM_TOKEN="optional-initial-zed-llm-token"
+```
+
+When `ZED_LLM_TOKEN` expires, the provider mints a fresh token, keeps it in
+memory, and retries the failed request once. `ZED_ACCESS_TOKEN` must be the Zed
+account access token, not the JSON response from `/client/llm_tokens`.
 
 ## Configure OpenCode
 

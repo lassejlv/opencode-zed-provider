@@ -1,9 +1,12 @@
+import { execFileSync } from "node:child_process";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { FetchFunction } from "@ai-sdk/provider-utils";
 
 type ProviderSettings = {
   name?: string;
   apiKey?: string;
+  userId?: string;
+  accessToken?: string;
   baseURL?: string;
   provider?: ZedProvider;
   headers?: Record<string, string>;
@@ -159,6 +162,10 @@ type ToolCallState = {
   arguments: string;
 };
 
+type ZedTokenResponse = {
+  token?: string;
+};
+
 export function createZedCloud(settings: ProviderSettings = {}) {
   const providerName = settings.name ?? "zed-cloud";
 
@@ -169,6 +176,8 @@ export function createZedCloud(settings: ProviderSettings = {}) {
     headers: settings.headers,
     fetch: createZedFetch({
       apiKey: settings.apiKey,
+      userId: settings.userId,
+      accessToken: settings.accessToken,
       baseURL: settings.baseURL,
       provider: settings.provider,
       headers: settings.headers,
@@ -177,13 +186,16 @@ export function createZedCloud(settings: ProviderSettings = {}) {
 }
 
 function createZedFetch(settings: ProviderSettings): FetchFunction {
+  let currentToken = settings.apiKey ?? process.env.ZED_LLM_TOKEN;
+  let refreshingToken: Promise<string> | undefined;
+
   const zedFetch = async (_input: Parameters<FetchFunction>[0], init?: Parameters<FetchFunction>[1]) => {
     if (init?.method !== "POST" || init.body === undefined) {
       return fetch(_input, init);
     }
 
     const request = JSON.parse(String(init.body)) as ChatCompletionRequest;
-    const token = zedToken(settings);
+    const token = currentToken ?? (await refreshAndCacheZedToken(settings, (token) => (currentToken = token)));
     const provider = settings.provider ?? providerForModel(request.model);
     const zedURL = `${settings.baseURL ?? "https://cloud.zed.dev"}/completions`;
     const zedRequest = {
@@ -194,18 +206,15 @@ function createZedFetch(settings: ProviderSettings): FetchFunction {
       provider_request: toProviderRequest(provider, request),
     };
 
-    const response = await fetch(zedURL, {
-      method: "POST",
-      signal: init.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-        "x-zed-client-supports-status-messages": "true",
-        "x-zed-client-supports-stream-ended-request-completion-status": "true",
-        ...settings.headers,
-      },
-      body: JSON.stringify(zedRequest),
-    });
+    let response = await fetchZedCompletion(zedURL, zedRequest, token, settings, init.signal);
+
+    if (response.status === 401) {
+      refreshingToken ??= refreshAndCacheZedToken(settings, (token) => (currentToken = token)).finally(() => {
+        refreshingToken = undefined;
+      });
+      currentToken = await refreshingToken;
+      response = await fetchZedCompletion(zedURL, zedRequest, currentToken, settings, init.signal);
+    }
 
     if (!response.ok) return response;
 
@@ -218,12 +227,134 @@ function createZedFetch(settings: ProviderSettings): FetchFunction {
   return zedFetch as FetchFunction;
 }
 
-function zedToken(settings: ProviderSettings) {
-  const token = settings.apiKey ?? process.env.ZED_LLM_TOKEN;
+async function fetchZedCompletion(
+  zedURL: string,
+  zedRequest: unknown,
+  token: string,
+  settings: ProviderSettings,
+  signal: AbortSignal | null | undefined,
+) {
+  return fetch(zedURL, {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${zedToken(token)}`,
+      "x-zed-client-supports-status-messages": "true",
+      "x-zed-client-supports-stream-ended-request-completion-status": "true",
+      ...settings.headers,
+    },
+    body: JSON.stringify(zedRequest),
+  });
+}
+
+function zedToken(token: string | undefined) {
   if (!token || token === "unused") {
-    throw new Error("Missing Zed LLM token. Set ZED_LLM_TOKEN or provider.options.apiKey.");
+    throw new Error(
+      "Missing Zed LLM token. Set ZED_LLM_TOKEN or provider.options.apiKey, or set ZED_USER_ID and ZED_ACCESS_TOKEN for automatic refresh.",
+    );
   }
   return token;
+}
+
+async function refreshAndCacheZedToken(settings: ProviderSettings, cache: (token: string) => void) {
+  const token = await refreshZedToken(settings);
+  cache(token);
+  return token;
+}
+
+async function refreshZedToken(settings: ProviderSettings) {
+  const credentials = zedAccountCredentials(settings);
+
+  if (!credentials) {
+    throw new Error(
+      "Zed LLM token expired and refresh credentials are missing. Set ZED_USER_ID and ZED_ACCESS_TOKEN, update ZED_LLM_TOKEN, or sign in to Zed so credentials are available in macOS Keychain.",
+    );
+  }
+
+  const response = await fetch(`${settings.baseURL ?? "https://cloud.zed.dev"}/client/llm_tokens`, {
+    method: "POST",
+    headers: {
+      ...settings.headers,
+      "Content-Type": "application/json",
+      Authorization: `${credentials.userId} ${credentials.accessToken}`,
+    },
+    body: JSON.stringify({ organization_id: null }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to refresh Zed LLM token: ${response.status} ${await response.text()}`);
+  }
+
+  const body = (await response.json()) as ZedTokenResponse;
+  if (!body.token) {
+    throw new Error("Failed to refresh Zed LLM token: response did not include token.");
+  }
+
+  return body.token;
+}
+
+function zedAccountCredentials(settings: ProviderSettings) {
+  const configuredUserId = settings.userId ?? process.env.ZED_USER_ID;
+  const configuredAccessToken = settings.accessToken ?? process.env.ZED_ACCESS_TOKEN;
+
+  if (configuredUserId && configuredAccessToken && !looksLikeMintedLlmToken(configuredAccessToken)) {
+    return {
+      userId: configuredUserId,
+      accessToken: configuredAccessToken,
+    };
+  }
+
+  return zedAccountCredentialsFromKeychain();
+}
+
+function looksLikeMintedLlmToken(value: string) {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("{") || trimmed.includes("client_token_")) return true;
+
+  try {
+    const parsed = JSON.parse(trimmed) as { token?: unknown };
+    return typeof parsed.token === "string";
+  } catch {
+    return false;
+  }
+}
+
+function zedAccountCredentialsFromKeychain() {
+  if (process.platform !== "darwin") return undefined;
+
+  for (const service of ["https://zed.dev", "zed.dev"]) {
+    const userId = keychainZedUserId(service);
+    const accessToken = keychainZedAccessToken(service);
+    if (userId && accessToken) return { userId, accessToken };
+  }
+
+  return undefined;
+}
+
+function keychainZedUserId(service: string) {
+  try {
+    const output = execFileSync("security", ["find-internet-password", "-s", service], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return /"acct"<blob>="([^"]+)"/u.exec(output)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+function keychainZedAccessToken(service: string) {
+  try {
+    const output = execFileSync("security", ["find-internet-password", "-s", service, "-w"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const token = output.trim();
+    return token.length > 0 ? token : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function providerForModel(model: string): ZedProvider {
